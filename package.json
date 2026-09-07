@@ -1,0 +1,19 @@
+{
+  "name": "zenn-content",
+  "version": "1.0.0",
+  "private": true,
+  "type": "module",
+  "engines": {
+    "node": ">=22.18"
+  },
+  "scripts": {
+    "sync": "node scripts/sync.mjs",
+    "validate": "zenn list:articles",
+    "preview": "npm run sync && zenn preview",
+    "publish": "./scripts/publish.sh"
+  },
+  "devDependencies": {
+    "gray-matter": "^4.0.3",
+    "zenn-cli": "latest"
+  }
+}
