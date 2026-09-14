@@ -1,174 +1,148 @@
 ---
-title: sbx-ai-eval-kitでQwenのコーディング能力を測ってみる
+title: Docker Sandboxesで再現可能なAIエージェント評価環境を作ってみる
 emoji: "\U0001F9EA"
 type: tech
 topics:
   - Docker Sandboxes
   - sbx-ai-eval-kit
-  - Qwen
-  - Qwen Code
+  - Codex
   - AIエージェント
-published: false
+  - LLM評価
+published: true
 ---
-## 仮タイトル
+## Docker Sandboxesとは
 
-sbx-ai-eval-kitでQwenのコーディング能力を測ってみる
+[Docker Sandboxes](https://docs.docker.com/ai/sandboxes/)は、コーディングエージェントを隔離されたsandbox環境で動かすための仕組みです。通常のDockerコンテナがホスト側のLinuxカーネルを共有するのに対し、Docker SandboxesはsandboxごとにmicroVMを起動し、その内部に独立したLinuxカーネル、ファイルシステム、Docker Engineを持ちます。
+![Docker Sandboxesの構成](/images/docker-sandbox-agent-evaluation/sandbox-architecture.png)
 
-## この記事の位置づけ
+https://docs.docker.com/ai/sandboxes/security/
 
-Docker Sandboxes、sbx-ai-eval-kit、Qwen、コーディングエージェント評価の関係を、実際に小さく動かしながら理解する最初の記事。
+各環境でプロセスやメモリが厳密に隔離されているため、コーディングエージェントはsandbox内で`sudo`を含む権限を使って自由に作業を行えます。その一方で、明示的にマウントされた作業ディレクトリを除き、コーディングエージェントがホスト環境に干渉することはできません。
 
-この段階ではモデル性能を厳密に比較したり、SWE-benchのスコアを出したりすることを目標にしない。Qwenが課題を受け取り、コードを変更し、テスト結果と実行ログが残るまでの一連の流れを作り、評価基盤の全体像をつかむ。
+ネットワーク面においても隔離の仕組みが組み込まれており、sandbox内から外部への通信はすべてproxy経由で行われます。proxyにはAllow/Denyポリシーを設定できるため、通信先を必要な外部サービスのみに制限できます。さらに、APIキーなどの認証情報をsandbox内のプロセスに直接渡さず、proxy側で認証を代行させる構成も可能です。
 
-## 読者に持ち帰ってほしいこと
+このような設計は、[Managed Agents](https://aistudio.google.com/managed-agents)や[Cloud Agents](https://cursor.com/ja/cloud)をはじめとするクラウド型エージェントで広く採用されている標準的なアプローチです。同様の隔離をローカル環境で実現できることが、Docker Sandboxesの大きな魅力です。
 
-- Docker Sandboxesが通常のDockerコンテナと何が違うか
-- sbx-ai-eval-kitが担当する範囲と、担当しない範囲
-- モデル、エージェントハーネス、実行環境、評価器を分けて考える理由
-- AIコーディング評価で最低限残したい証跡
-- 次にSWE-benchへ進むために何が不足しているか
+## コーディングエージェントをYOLOモードで実行する
 
-## 記事の問い
+Docker Sandboxesを利用するには、まず`sbx` CLIをインストールします（[インストール](https://docs.docker.com/ai/sandboxes/install/)）。
 
-1. sbx-ai-eval-kitだけでQwenのコーディング能力を測れるのか
-2. Qwenをコーディングエージェントとして動かすには、どのハーネスが必要か
-3. Docker Sandboxesは実行の安全性と再現性にどう関わるか
-4. 小さなテスト付き課題を、どこまで自動実行・自動判定できるか
-5. 実験をもう一度実行したとき、同じ結果になるか
-
-## 想定する全体構成
-
-```text
-コーディング課題
-    ↓
-Qwenモデル
-    ↓
-コーディングエージェントのハーネス
-    ↓
-Docker Sandboxes上でファイル編集・コマンド実行
-    ↓
-テストによる判定
-    ↓
-ログ・生成パッチ・評価結果を保存
+```bash
+sbx version
+# sbx version: v0.42.1 cc6e400a4a3ce3ce5e0b2b77b8ee352aac854c64
 ```
 
-## 構成案
+sandbox内でコーディングエージェントを起動するには、`sbx run`を実行します。以下はCodexの例ですが、他にも様々なサービスに対応しています（[対応エージェント一覧](https://docs.docker.com/ai/sandboxes/agents/)）。CodexのOAuth認証はホスト側で管理されるため、一度認証すればログイン状態を再利用できます。
 
-### 1. なぜ試すのか
+```bash
+cd ~/your-project
+sbx run codex
+```
 
-- AIコーディングエージェントはコード生成だけでなく、任意コマンドを実行する
-- ホストで自動承認モードを使うことへの不安
-- モデルを固定しても、実行環境が違えば評価結果が変わる問題
-- まず小さく一周動かし、評価に必要な部品を把握したい
+デフォルトの動作モードは`Direct mode`です。このモードでは、指定したホスト上の作業ディレクトリがそのままsandboxにマウントされます。コーディングエージェントはマウントされたファイルを直接編集するため、sandbox終了後も変更内容がホスト側に保持されます。
 
-### 2. Docker Sandboxesとは何か
+一方、ホスト側の作業ツリーを汚したくない場合は`Clone mode`を使用します。このモードでは、ホスト上のリポジトリが読み取り専用でsandboxに共有され、コーディングエージェントはsandbox内に作成されたclone上で作業します。
 
-- サンドボックスごとに独立したmicroVMを使う
-- VM内に独立したLinuxカーネル、ファイルシステム、ネットワーク、Docker Engineがある
-- 通常のコンテナやDocker socket共有との違い
-- direct mount、clone mode、mountlessの違い
-- 「隔離されている」と「ホストへ影響しない」は同義ではない
+```bash
+sbx run codex --clone
+```
 
-### 3. sbx-ai-eval-kitを読んでみる
+Dockerの公式ドキュメントでは、sandboxそのものをセキュリティ境界とみなし、コーディングエージェントをユーザー承認なし（YOLO mode）で動かす構成が推奨されています。
 
-- `evaluation.yaml`が表すもの
-- Local ExecutorとSBX Executor
-- stdout、stderr、終了コード、所要時間、設定ダイジェストの保存
-- 実行ごとにsandboxを作成・削除する流れ
-- 現状はモデル実行や自動採点を行わないこと
+例えば、Codexのデフォルトの起動コマンドは`codex --dangerously-bypass-approvals-and-sandbox`に設定されています。そのため、ホスト側の環境への影響をsandboxが防止してくれるため、対話的に承認を行わずに安心して長時間のタスクをコーディングエージェントに任せやすくなります。
 
-### 4. Qwenをどう接続するか考える
+## Docker Sandboxes上でコーディングエージェントを評価する
 
-- モデルとコーディングエージェントハーネスの違い
-- Qwen Codeなどの候補
-- ローカルモデルサーバーとOpenAI互換API
-- Qwen 8B系のモデル名、revision、量子化方式を固定する必要
-- 自動承認モードをsandbox内だけで許可する構成
+microVM上で動作するDocker Sandboxesは、隔離された実行基盤を提供すると同時に、同じ構成のsandboxを作り直せるという強みがあります。言い換えると、環境の再現性が担保しやすいと言えます。
 
-### 5. 最小の評価課題を作る
+Docker Sandboxesには、環境の構成・再利用を支援する[Kits](https://docs.docker.com/ai/sandboxes/customize/kits/)という仕組みが用意されています。Kitsでは、`setup`で事前インストールコマンド、`environment`で環境変数、`agentInstructions`でコーディングエージェント向けの指示などを定義できます。
 
-- 初回はSWE-benchではなく、小さなテスト付き課題を1〜3問使う
-- 例: 境界値バグの修正、既存APIを維持した小機能追加
-- 問題文、開始commit、制限時間、試行回数を固定する
-- 既存テストと課題専用テストで成否を判定する
+今回は、[Docker公式の技術記事](https://www.docker.com/ja-jp/blog/building-reproducible-ai-evaluation-workflows-with-docker-sandboxes/)を参考に、Kitsを活用したコーディングエージェントの評価環境を構築しました。リポジトリはこちらにあります。
 
-### 6. 実際に一周動かす
+https://github.com/bvv-1/docker-sandboxes-test
 
-- sandboxを作る
-- 課題をQwenへ渡す
-- エージェントが調査・編集・テストする
-- 終了後に生成パッチとログを回収する
-- sandboxを削除する
+Kitsが評価・実行環境を固定し、Pythonスクリプト経由で各試行を起動します。標準出力、標準エラー出力、終了コード、実行時間、生成パッチ、テスト結果はすべて`.runs/<run-id>/`に保存されます。なお、評価にはLLM-as-a-judgeではなく、`unittest`による決定的なテストを使用しています。
 
-この節のコマンドと画面出力は、実際に触った後で記載する。
+今回はモデルを[Qwen3-Coder-30B-A3B-Instruct](https://huggingface.co/unsloth/Qwen3-Coder-30B-A3B-Instruct-GGUF)をOpenCode / Cline / Aiderの3つのエージェントツール経由で動かした際のパフォーマンスを比較しました。Qwen3-CoderはMoE (Mixture of Experts) 構成のモデルであり、`A3B`は推論時にアクティブになるパラメータ数が約30億であることを示します。軽量なため、24GBメモリのM3 Macbook上でも動作します。モデルサーバーには`llama.cpp`を使用しました。
 
-### 7. 結果を見る
+ディレクトリ構成は以下の通りです。
 
-| 課題 | 成功回数 / 試行回数 | 所要時間 | ツール呼び出し回数 | 主な失敗理由 |
-|---|---:|---:|---:|---|
-| 課題1 | 未実施 | 未実施 | 未実施 | 未実施 |
-| 課題2 | 未実施 | 未実施 | 未実施 | 未実施 |
-| 課題3 | 未実施 | 未実施 | 未実施 | 未実施 |
+```text
+kits/
+├── ai-eval/        共通の評価用ツールとエージェント指示
+├── opencode-local/ OpenCodeとローカルモデルの接続設定
+├── cline-local/    Cline CLIとローカルモデルの接続設定
+└── aider-local/    Aiderとローカルモデルの接続設定
+```
 
-スコアだけでなく、代表的な成功例と失敗例を一つずつ取り上げる。モデルの失敗、ハーネスの失敗、環境構築の失敗を分けて考える。
+例えば、OpenCode用のKitsでは以下のように定義しています。
 
-### 8. 触って分かったこと
+```yaml
+schemaVersion: "2"
+kind: sandbox
+name: opencode-local
+version: "0.1.0"
+displayName: OpenCode with local llama.cpp
+description: Extends the built-in OpenCode agent for the pinned local model endpoint.
+extends: opencode
 
-実験後、以下の観点で整理する。
+args:
+  opencode_version:
+    default: "1.18.30"
+    pattern: '^[0-9]+\.[0-9]+\.[0-9]+$'
+  model_port:
+    default: "9931"
+    pattern: '^[0-9]{2,5}$'
+  model_alias:
+    default: qwen3-coder-30b-a3b-instruct-q3-k-s
 
-- 想定より簡単だった部分
-- 手作業が残った部分
-- 再実行して結果が変わった部分
-- Docker Sandboxesによって防げたリスク
-- Docker Sandboxesだけでは防げないリスク
-- sbx-ai-eval-kitへ追加したくなった機能
+agentInstructions:
+  filename: AGENTS.md
+  content: |
+    Use the local OpenAI-compatible model configured by this kit.
 
-### 9. 今回の限界
+environment:
+  variables:
+    OPENCODE_CONFIG: /home/agent/.config/opencode/local-eval.json
 
-- 少数の自作課題ではQwenの一般的な性能を評価できない
-- 他モデル、他ハーネスとの比較ではない
-- 量子化とローカル実行環境の影響を含む
-- sandboxを使っても、モデルや依存関係を固定しなければ再現性は保証されない
+permissions:
+  network:
+    allow:
+      - host.docker.internal
+      - localhost
+      - registry.npmjs.org
 
-### 10. 次はSWE-bench Verifiedへ
+setup:
+  install:
+    - command: "npm install --global opencode-ai@${{ kit.args.opencode_version }}"
+      user: "1000"
+```
 
-- 小さな課題をSWE-benchの固定サブセットへ置き換える
-- SWE-benchの評価コンテナをsandbox内のDocker Engineで動かす
-- 10〜20問を複数回実行してばらつきを見る
-- 公式リーダーボード相当ではなく、評価ワークフローの検証として扱う
+評価は以下のコマンドで実行します。
 
-## 実験前に決めること
+```bash
+make eval-polyglot AGENTS="opencode" TASKS="proverb" TRIALS=3
+```
 
-- [ ] Qwenの正確なモデルIDとrevision
-- [ ] 量子化方式
-- [ ] 推論ランタイム
-- [ ] コーディングエージェントハーネス
-- [ ] 自動承認・非対話実行の方法
-- [ ] 最初の評価課題
-- [ ] 制限時間と試行回数
-- [ ] ネットワークポリシー
-- [ ] 保存するログと成果物の形式
-- [ ] 成功・失敗の判定基準
+ベンチマークには、[Aider Polyglot Benchmark](https://github.com/Aider-AI/polyglot-benchmark)から次の4課題を選定しました。
 
-## 保存したい証跡
+- [connect](https://github.com/Aider-AI/polyglot-benchmark/tree/main/python/exercises/practice/connect): Hex（ボードゲーム）の勝者を判定する
+- [bowling](https://github.com/Aider-AI/polyglot-benchmark/tree/main/python/exercises/practice/bowling): ボウリングの投球結果からスコアを計算する
+- [go-counting](https://github.com/Aider-AI/polyglot-benchmark/tree/main/python/exercises/practice/go-counting): 囲碁の盤面における地を判定する
+- [proverb](https://github.com/Aider-AI/polyglot-benchmark/tree/main/python/exercises/practice/proverb): 入力からことわざを組み立てる
 
-- 環境情報と各ツールのバージョン
-- モデルID、revision、量子化方式、生成パラメータ
-- 課題文と開始commit
-- 実行コマンド
-- エージェントのイベントログ
-- stdoutとstderr
-- 終了コードと所要時間
-- 生成されたGit diff
-- テスト結果
-- 最終的な判定と失敗理由
+各課題を3回ずつ実行した結果は以下のようになりました。
 
-## 参考資料
+| エージェント   | connect | bowling | go-counting | proverb |
+| -------- | ------: | ------: | ----------: | ------- |
+| OpenCode |   0 / 3 |   0 / 3 |       0 / 3 | 3 / 3   |
+| Cline    |   0 / 3 |   0 / 3 |       0 / 3 | 2 / 3   |
+| Aider    |   0 / 3 |   0 / 3 |       0 / 3 | 3 / 3   |
 
-- [Docker Sandboxes](https://docs.docker.com/ai/sandboxes/)
-- [Docker Sandboxesのアーキテクチャ](https://docs.docker.com/ai/sandboxes/architecture/)
-- [Docker Sandboxesのセキュリティモデル](https://docs.docker.com/ai/sandboxes/security/)
-- [sbx-ai-eval-kit](https://github.com/karanverma/sbx-ai-eval-kit)
-- [Dockerサンドボックスを使用して再現可能なAI評価ワークフローを構築する](https://www.docker.com/ja-jp/blog/building-reproducible-ai-evaluation-workflows-with-docker-sandboxes/)
-- [Qwen Code](https://github.com/QwenLM/qwen-code)
-- [SWE-bench](https://github.com/SWE-bench/SWE-bench)
+`proverb`のような比較的シンプルな問題は安定して解けた一方で、それ以外の問題は解くことができませんでした。なお、`proverb`でClineが失敗した回は、コンテキスト長の上限（16,384 tokens）の超過が原因となっており、環境的な制約で十分な能力を発揮できなかった可能性もあります。
+
+## おわりに
+
+いかがでしたか？Docker Sandboxesは、コーディングエージェントをYOLO modeで安全に動かすためのセキュリティ境界として強力なツールなだけでなく、再現可能な評価環境を作る仕組みにも使えます。
+
+コーディングエージェントを安全に活用したい方や、eval-drivenでハーネスを整備したい方はぜひ触ってみてください！
