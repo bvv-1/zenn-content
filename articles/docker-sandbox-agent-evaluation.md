@@ -1,13 +1,12 @@
 ---
-title: Docker Sandboxesで再現可能なAIエージェント評価環境を作ってみる
+title: Docker Sandboxesで再現可能なコーディングエージェント評価環境を作ってみる
 emoji: "\U0001F9EA"
 type: tech
 topics:
-  - Docker Sandboxes
-  - sbx-ai-eval-kit
-  - Codex
-  - AIエージェント
-  - LLM評価
+  - docker
+  - aiエージェント
+  - sandbox
+  - qwen
 published: true
 ---
 ## Docker Sandboxesとは
