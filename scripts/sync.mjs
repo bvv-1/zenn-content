@@ -48,7 +48,26 @@ for (const entry of entries) {
   if (!['tech', 'idea'].includes(parsed.data.type)) throw new Error(`${entry.name}: type は tech または idea にしてください`);
 
   const topics = Array.isArray(parsed.data.tags) ? parsed.data.tags.map(String).slice(0, 5) : [];
-  const body = parsed.content.replace(/\]\(images\//g, '](/images/');
+  let body = parsed.content.replace(/\]\(images\//g, '](/images/');
+  for (const match of parsed.content.matchAll(/!\[\[([^\]]+)\]\]/g)) {
+    const reference = match[1].split('|')[0];
+    const fileName = path.basename(reference);
+    const articleImage = path.join(sourceDir, 'images', slug, fileName);
+    const vaultImage = path.join(sourceDir, '..', reference);
+    const sourceImage = (await fs.stat(articleImage).catch(() => null))?.isFile()
+      ? articleImage
+      : vaultImage;
+    if (!(await fs.stat(sourceImage).catch(() => null))?.isFile()) {
+      throw new Error(`${entry.name}: 画像が見つかりません: ${reference}`);
+    }
+    const relativeImage = path.join('images', slug, fileName);
+    if (sourceImage === vaultImage) {
+      await fs.mkdir(path.join(imagesDir, slug), { recursive: true });
+      await fs.copyFile(sourceImage, path.join(root, relativeImage));
+      generated.push(relativeImage);
+    }
+    body = body.replace(match[0], `![${path.parse(fileName).name}](/images/${slug}/${fileName})`);
+  }
   const output = matter.stringify(body.trimStart(), {
     title: String(parsed.data.title),
     emoji: String(parsed.data.emoji || '📝'),
@@ -67,6 +86,7 @@ const sourceImages = path.join(sourceDir, 'images');
 const imageEntries = await fs.readdir(sourceImages, { recursive: true, withFileTypes: true }).catch(() => []);
 for (const entry of imageEntries) {
   if (!entry.isFile()) continue;
+  if (!/\.(?:png|jpe?g|gif|webp|svg|avif)$/i.test(entry.name)) continue;
   const relativeParent = path.relative(sourceImages, entry.parentPath);
   const relativePath = path.join('images', relativeParent, entry.name);
   const destination = path.join(root, relativePath);
