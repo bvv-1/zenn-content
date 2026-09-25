@@ -77,7 +77,7 @@ coyote test ./Example.dll --iterations 100
 この`.trace`を使うことで、失敗した実行順序を決定的に再現することができます。
 
 ```bash
-coyote replay
+coyote replay ./Example.dll ./path/to/bug.trace
 ```
 
 ## 3. DB操作のレースコンディションを検出する
